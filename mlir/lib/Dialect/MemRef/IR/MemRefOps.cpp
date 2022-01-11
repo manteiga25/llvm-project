@@ -395,7 +395,7 @@ bool CastOp::areCastCompatible(TypeRange inputs, TypeRange outputs) {
       };
       if (!checkCompatible(aOffset, bOffset))
         return false;
-      for (auto aStride : enumerate(aStrides))
+      for (const auto &aStride : enumerate(aStrides))
         if (!checkCompatible(aStride.value(), bStrides[aStride.index()]))
           return false;
     }
@@ -428,10 +428,7 @@ bool CastOp::areCastCompatible(TypeRange inputs, TypeRange outputs) {
 
     auto aMemSpace = (aT) ? aT.getMemorySpace() : uaT.getMemorySpace();
     auto bMemSpace = (bT) ? bT.getMemorySpace() : ubT.getMemorySpace();
-    if (aMemSpace != bMemSpace)
-      return false;
-
-    return true;
+    return aMemSpace == bMemSpace;
   }
 
   return false;
@@ -518,7 +515,7 @@ computeMemRefRankReductionMask(MemRefType originalType, MemRefType reducedType,
   if (originalType.getRank() == reducedType.getRank())
     return unusedDims;
 
-  for (auto dim : llvm::enumerate(sizes))
+  for (const auto &dim : llvm::enumerate(sizes))
     if (auto attr = dim.value().dyn_cast<Attribute>())
       if (attr.cast<IntegerAttr>().getInt() == 1)
         unusedDims.insert(dim.index());
@@ -1158,40 +1155,44 @@ static LogicalResult verify(ReinterpretCastOp op) {
                                  extractFromI64ArrayAttr(op.static_sizes())))) {
     int64_t resultSize = std::get<0>(en.value());
     int64_t expectedSize = std::get<1>(en.value());
-    if (!ShapedType::isDynamic(resultSize) && resultSize != expectedSize)
+    if (!ShapedType::isDynamic(resultSize) &&
+        !ShapedType::isDynamic(expectedSize) && resultSize != expectedSize)
       return op.emitError("expected result type with size = ")
              << expectedSize << " instead of " << resultSize
              << " in dim = " << en.index();
   }
 
-  // Match offset and strides in static_offset and static_strides attributes if
-  // result memref type has an affine map specified.
-  if (!resultType.getLayout().isIdentity()) {
-    int64_t resultOffset;
-    SmallVector<int64_t, 4> resultStrides;
-    if (failed(getStridesAndOffset(resultType, resultStrides, resultOffset)))
-      return failure();
+  // Match offset and strides in static_offset and static_strides attributes. If
+  // result memref type has no affine map specified, this will assume an
+  // identity layout.
+  int64_t resultOffset;
+  SmallVector<int64_t, 4> resultStrides;
+  if (failed(getStridesAndOffset(resultType, resultStrides, resultOffset)))
+    return op.emitError(
+               "expected result type to have strided layout but found ")
+           << resultType;
 
-    // Match offset in result memref type and in static_offsets attribute.
-    int64_t expectedOffset =
-        extractFromI64ArrayAttr(op.static_offsets()).front();
-    if (!ShapedType::isDynamicStrideOrOffset(resultOffset) &&
-        resultOffset != expectedOffset)
-      return op.emitError("expected result type with offset = ")
-             << resultOffset << " instead of " << expectedOffset;
+  // Match offset in result memref type and in static_offsets attribute.
+  int64_t expectedOffset = extractFromI64ArrayAttr(op.static_offsets()).front();
+  if (!ShapedType::isDynamicStrideOrOffset(resultOffset) &&
+      !ShapedType::isDynamicStrideOrOffset(expectedOffset) &&
+      resultOffset != expectedOffset)
+    return op.emitError("expected result type with offset = ")
+           << resultOffset << " instead of " << expectedOffset;
 
-    // Match strides in result memref type and in static_strides attribute.
-    for (auto &en : llvm::enumerate(llvm::zip(
-             resultStrides, extractFromI64ArrayAttr(op.static_strides())))) {
-      int64_t resultStride = std::get<0>(en.value());
-      int64_t expectedStride = std::get<1>(en.value());
-      if (!ShapedType::isDynamicStrideOrOffset(resultStride) &&
-          resultStride != expectedStride)
-        return op.emitError("expected result type with stride = ")
-               << expectedStride << " instead of " << resultStride
-               << " in dim = " << en.index();
-    }
+  // Match strides in result memref type and in static_strides attribute.
+  for (auto &en : llvm::enumerate(llvm::zip(
+           resultStrides, extractFromI64ArrayAttr(op.static_strides())))) {
+    int64_t resultStride = std::get<0>(en.value());
+    int64_t expectedStride = std::get<1>(en.value());
+    if (!ShapedType::isDynamicStrideOrOffset(resultStride) &&
+        !ShapedType::isDynamicStrideOrOffset(expectedStride) &&
+        resultStride != expectedStride)
+      return op.emitError("expected result type with stride = ")
+             << expectedStride << " instead of " << resultStride
+             << " in dim = " << en.index();
   }
+
   return success();
 }
 
@@ -1500,9 +1501,9 @@ Type SubViewOp::inferResultType(MemRefType sourceMemRefType,
                                 ArrayRef<int64_t> staticStrides) {
   unsigned rank = sourceMemRefType.getRank();
   (void)rank;
-  assert(staticOffsets.size() == rank && "unexpected staticOffsets overflow");
-  assert(staticSizes.size() == rank && "unexpected staticSizes overflow");
-  assert(staticStrides.size() == rank && "unexpected staticStrides overflow");
+  assert(staticOffsets.size() == rank && "staticOffsets length mismatch");
+  assert(staticSizes.size() == rank && "staticSizes length mismatch");
+  assert(staticStrides.size() == rank && "staticStrides length mismatch");
 
   // Extract source offset and strides.
   int64_t sourceOffset;
@@ -1854,7 +1855,7 @@ static MemRefType getCanonicalSubViewResultType(
   if (!unusedDims)
     return nullptr;
   SmallVector<int64_t> shape;
-  for (auto sizes : llvm::enumerate(nonRankReducedType.getShape())) {
+  for (const auto &sizes : llvm::enumerate(nonRankReducedType.getShape())) {
     if (unusedDims->count(sizes.index()))
       continue;
     shape.push_back(sizes.value());
@@ -1906,7 +1907,7 @@ static bool isTrivialSubViewOp(SubViewOp subViewOp) {
 
   // Check all size values are static and matches the (static) source shape.
   ArrayRef<int64_t> sourceShape = subViewOp.getSourceType().getShape();
-  for (auto size : llvm::enumerate(mixedSizes)) {
+  for (const auto &size : llvm::enumerate(mixedSizes)) {
     Optional<int64_t> intValue = getConstantIntValue(size.value());
     if (!intValue || intValue.getValue() != sourceShape[size.index()])
       return false;
@@ -2043,7 +2044,7 @@ static MemRefType inferTransposeResultType(MemRefType memRefType,
   auto originalSizes = memRefType.getShape();
   // Compute permuted sizes.
   SmallVector<int64_t, 4> sizes(rank, 0);
-  for (auto en : llvm::enumerate(permutationMap.getResults()))
+  for (const auto &en : llvm::enumerate(permutationMap.getResults()))
     sizes[en.index()] =
         originalSizes[en.value().cast<AffineDimExpr>().getPosition()];
 
@@ -2284,6 +2285,50 @@ struct ViewOpMemrefCastFolder : public OpRewritePattern<ViewOp> {
 void ViewOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                          MLIRContext *context) {
   results.add<ViewOpShapeFolder, ViewOpMemrefCastFolder>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// AtomicRMWOp
+//===----------------------------------------------------------------------===//
+
+static LogicalResult verify(AtomicRMWOp op) {
+  if (op.getMemRefType().getRank() != op.getNumOperands() - 2)
+    return op.emitOpError(
+        "expects the number of subscripts to be equal to memref rank");
+  switch (op.kind()) {
+  case arith::AtomicRMWKind::addf:
+  case arith::AtomicRMWKind::maxf:
+  case arith::AtomicRMWKind::minf:
+  case arith::AtomicRMWKind::mulf:
+    if (!op.value().getType().isa<FloatType>())
+      return op.emitOpError()
+             << "with kind '" << arith::stringifyAtomicRMWKind(op.kind())
+             << "' expects a floating-point type";
+    break;
+  case arith::AtomicRMWKind::addi:
+  case arith::AtomicRMWKind::maxs:
+  case arith::AtomicRMWKind::maxu:
+  case arith::AtomicRMWKind::mins:
+  case arith::AtomicRMWKind::minu:
+  case arith::AtomicRMWKind::muli:
+  case arith::AtomicRMWKind::ori:
+  case arith::AtomicRMWKind::andi:
+    if (!op.value().getType().isa<IntegerType>())
+      return op.emitOpError()
+             << "with kind '" << arith::stringifyAtomicRMWKind(op.kind())
+             << "' expects an integer type";
+    break;
+  default:
+    break;
+  }
+  return success();
+}
+
+OpFoldResult AtomicRMWOp::fold(ArrayRef<Attribute> operands) {
+  /// atomicrmw(memrefcast) -> atomicrmw
+  if (succeeded(foldMemRefCast(*this, value())))
+    return getResult();
+  return OpFoldResult();
 }
 
 //===----------------------------------------------------------------------===//

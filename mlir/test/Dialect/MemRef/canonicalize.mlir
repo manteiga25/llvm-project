@@ -151,7 +151,7 @@ func @multiple_reducing_dims_all_dynamic(%arg0 : memref<?x?x?xf32, offset: ?, st
 //       CHECK:   return %[[SIZE]] : index
 func @dim_of_sized_view(%arg : memref<?xi8>, %size: index) -> index {
   %c0 = arith.constant 0 : index
-  %0 = memref.reinterpret_cast %arg to offset: [0], sizes: [%size], strides: [0] : memref<?xi8> to memref<?xi8>
+  %0 = memref.reinterpret_cast %arg to offset: [0], sizes: [%size], strides: [1] : memref<?xi8> to memref<?xi8>
   %1 = memref.dim %0, %c0 : memref<?xi8>
   return %1 : index
 }
@@ -499,3 +499,14 @@ func @no_fold_dynamic_no_op_subview(%arg0 : memref<?x?xf32>) -> memref<?x?xf32, 
 // CHECK-LABEL: func @no_fold_dynamic_no_op_subview(
 //       CHECK:   %[[SUBVIEW:.+]] = memref.subview
 //       CHECK:    return %[[SUBVIEW]]
+
+// -----
+
+func @atomicrmw_cast_fold(%arg0 : f32, %arg1 : memref<4xf32>, %c : index) {
+  %v = memref.cast %arg1 : memref<4xf32> to memref<?xf32>
+  %a = memref.atomic_rmw addf %arg0, %v[%c] : (f32, memref<?xf32>) -> f32
+  return
+}
+
+// CHECK-LABEL: func @atomicrmw_cast_fold
+// CHECK-NEXT: memref.atomic_rmw addf %arg0, %arg1[%arg2] : (f32, memref<4xf32>) -> f32

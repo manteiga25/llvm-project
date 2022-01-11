@@ -170,13 +170,11 @@ Driver::Driver(StringRef ClangExecutable, StringRef TargetTriple,
     : Diags(Diags), VFS(std::move(VFS)), Mode(GCCMode),
       SaveTemps(SaveTempsNone), BitcodeEmbed(EmbedNone), LTOMode(LTOK_None),
       ClangExecutable(ClangExecutable), SysRoot(DEFAULT_SYSROOT),
-      DriverTitle(Title), CCPrintStatReportFilename(), CCPrintOptionsFilename(),
-      CCPrintHeadersFilename(), CCLogDiagnosticsFilename(),
-      CCCPrintBindings(false), CCPrintOptions(false), CCPrintHeaders(false),
-      CCLogDiagnostics(false), CCGenDiagnostics(false),
-      CCPrintProcessStats(false), TargetTriple(TargetTriple),
-      CCCGenericGCCName(""), Saver(Alloc), CheckInputsExist(true),
-      GenReproducer(false), SuppressMissingInputWarning(false) {
+      DriverTitle(Title), CCCPrintBindings(false), CCPrintOptions(false),
+      CCPrintHeaders(false), CCLogDiagnostics(false), CCGenDiagnostics(false),
+      CCPrintProcessStats(false), TargetTriple(TargetTriple), Saver(Alloc),
+      CheckInputsExist(true), GenReproducer(false),
+      SuppressMissingInputWarning(false) {
   // Provide a sane fallback if no VFS is specified.
   if (!this->VFS)
     this->VFS = llvm::vfs::getRealFileSystem();
@@ -369,7 +367,20 @@ DerivedArgList *Driver::TranslateInputArgs(const InputArgList &Args) const {
   bool HasNostdlib = Args.hasArg(options::OPT_nostdlib);
   bool HasNostdlibxx = Args.hasArg(options::OPT_nostdlibxx);
   bool HasNodefaultlib = Args.hasArg(options::OPT_nodefaultlibs);
+  bool IgnoreUnused = false;
   for (Arg *A : Args) {
+    if (IgnoreUnused)
+      A->claim();
+
+    if (A->getOption().matches(options::OPT_start_no_unused_arguments)) {
+      IgnoreUnused = true;
+      continue;
+    }
+    if (A->getOption().matches(options::OPT_end_no_unused_arguments)) {
+      IgnoreUnused = false;
+      continue;
+    }
+
     // Unfortunately, we have to parse some forwarding options (-Xassembler,
     // -Xlinker, -Xpreprocessor) because we either integrate their functionality
     // (assembler and preprocessor), or bypass a previous driver ('collect2').
@@ -1871,9 +1882,16 @@ bool Driver::HandleImmediateArgs(const Compilation &C) {
   }
 
   if (C.getArgs().hasArg(options::OPT_print_runtime_dir)) {
-    std::string CandidateRuntimePath = TC.getRuntimePath();
-    if (getVFS().exists(CandidateRuntimePath))
-      llvm::outs() << CandidateRuntimePath << '\n';
+    std::string RuntimePath;
+    // Get the first existing path, if any.
+    for (auto Path : TC.getRuntimePaths()) {
+      if (getVFS().exists(Path)) {
+        RuntimePath = Path;
+        break;
+      }
+    }
+    if (!RuntimePath.empty())
+      llvm::outs() << RuntimePath << '\n';
     else
       llvm::outs() << TC.getCompilerRTPath() << '\n';
     return false;
@@ -3105,7 +3123,7 @@ class OffloadingActionBuilder final {
         // We will pass the device action as a host dependence, so we don't
         // need to do anything else with them.
         CudaDeviceActions.clear();
-        return ABRT_Success;
+        return CompileDeviceOnly ? ABRT_Ignore_Host : ABRT_Success;
       }
 
       // By default, we produce an action for each device arch.
@@ -3138,6 +3156,7 @@ class OffloadingActionBuilder final {
       assert(DeviceLinkerInputs.size() == GpuArchList.size() &&
              "Linker inputs and GPU arch list sizes do not match.");
 
+      ActionList Actions;
       // Append a new link action for each device.
       unsigned I = 0;
       for (auto &LI : DeviceLinkerInputs) {
@@ -3149,22 +3168,29 @@ class OffloadingActionBuilder final {
         OffloadAction::DeviceDependences DeviceLinkDeps;
         DeviceLinkDeps.add(*DeviceLinkAction, *ToolChains[0],
             GpuArchList[I], AssociatedOffloadKind);
-        AL.push_back(C.MakeAction<OffloadAction>(DeviceLinkDeps,
-            DeviceLinkAction->getType()));
+        Actions.push_back(C.MakeAction<OffloadAction>(
+            DeviceLinkDeps, DeviceLinkAction->getType()));
         ++I;
       }
       DeviceLinkerInputs.clear();
 
       // Create a host object from all the device images by embedding them
-      // in a fat binary.
+      // in a fat binary for mixed host-device compilation. For device-only
+      // compilation, creates a fat binary.
       OffloadAction::DeviceDependences DDeps;
-      auto *TopDeviceLinkAction =
-          C.MakeAction<LinkJobAction>(AL, types::TY_Object);
-      DDeps.add(*TopDeviceLinkAction, *ToolChains[0],
-          nullptr, AssociatedOffloadKind);
-
-      // Offload the host object to the host linker.
-      AL.push_back(C.MakeAction<OffloadAction>(DDeps, TopDeviceLinkAction->getType()));
+      if (!CompileDeviceOnly || !BundleOutput.hasValue() ||
+          BundleOutput.getValue()) {
+        auto *TopDeviceLinkAction = C.MakeAction<LinkJobAction>(
+            Actions,
+            CompileDeviceOnly ? types::TY_HIP_FATBIN : types::TY_Object);
+        DDeps.add(*TopDeviceLinkAction, *ToolChains[0], nullptr,
+                  AssociatedOffloadKind);
+        // Offload the host object to the host linker.
+        AL.push_back(
+            C.MakeAction<OffloadAction>(DDeps, TopDeviceLinkAction->getType()));
+      } else {
+        AL.append(Actions);
+      }
     }
 
     Action* appendLinkHostActions(ActionList &AL) override { return AL.back(); }
@@ -3551,15 +3577,18 @@ public:
     return false;
   }
 
-  Action* makeHostLinkAction() {
-    // Build a list of device linking actions.
-    ActionList DeviceAL;
+  void appendDeviceLinkActions(ActionList &AL) {
     for (DeviceActionBuilder *SB : SpecializedBuilders) {
       if (!SB->isValid())
         continue;
-      SB->appendLinkDeviceActions(DeviceAL);
+      SB->appendLinkDeviceActions(AL);
     }
+  }
 
+  Action *makeHostLinkAction() {
+    // Build a list of device linking actions.
+    ActionList DeviceAL;
+    appendDeviceLinkActions(DeviceAL);
     if (DeviceAL.empty())
       return nullptr;
 
@@ -3888,6 +3917,13 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
   }
 
   // Add a link action if necessary.
+
+  if (LinkerInputs.empty()) {
+    Arg *FinalPhaseArg;
+    if (getFinalPhase(Args, &FinalPhaseArg) == phases::Link)
+      OffloadBuilder.appendDeviceLinkActions(Actions);
+  }
+
   if (!LinkerInputs.empty()) {
     if (Action *Wrapper = OffloadBuilder.makeHostLinkAction())
       LinkerInputs.push_back(Wrapper);
